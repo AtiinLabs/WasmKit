@@ -595,6 +595,12 @@ extension Execution {
             )
         } else {
             try invokeHostFunction(function: function.host, sp: sp, spAddend: spAddend)
+            // A host function may re-enter the guest and grow the caller's
+            // default memory. A malloc-backed memory moves when it grows, so the
+            // cached base and bound would otherwise be left dangling.
+            if let instance = sp.currentInstance {
+                CurrentMemory.mayUpdateCurrentInstance(instance: instance, md: &md, ms: &ms)
+            }
             return (pc, sp)
         }
     }
@@ -612,6 +618,9 @@ extension Execution {
             )
         } else {
             try invokeHostFunction(function: function.host, sp: sp, spAddend: 0)
+            if let instance = sp.currentInstance {
+                CurrentMemory.mayUpdateCurrentInstance(instance: instance, md: &md, ms: &ms)
+            }
             return (pc, sp)
         }
     }

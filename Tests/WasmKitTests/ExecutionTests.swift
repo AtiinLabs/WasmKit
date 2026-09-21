@@ -56,6 +56,43 @@ struct ExecutionTests {
         #expect(results == [.i32(42)])
     }
 
+    /// A host function may re-enter the guest and grow the caller's memory. The interpreter's
+    /// cached memory base and bound have to be refreshed when the host call returns, or the next
+    /// in-bounds access traps (or, with a moving buffer, reads freed storage).
+    @Test
+    func aHostCallThatGrowsMemoryDoesNotLeaveTheCachedMemoryStale() throws {
+        let module = try parseWasm(
+            bytes: wat2wasm(
+                """
+                (module
+                  (import "env" "cb" (func $cb))
+                  (memory (export "mem") 1 100)
+                  (func (export "growit") (result i32) (memory.grow (i32.const 8)))
+                  (func (export "start") (result i32)
+                    (call $cb)
+                    ;; In bounds only once the callback has grown the memory.
+                    (i32.store (i32.const 100000) (i32.const 0x5A5A5A5A))
+                    (i32.load (i32.const 100000))))
+                """
+            )
+        )
+        let store = Store(engine: Engine())
+        final class Box: @unchecked Sendable { var instance: Instance? }
+        let box = Box()
+        var imports = Imports()
+        imports.define(
+            module: "env", name: "cb",
+            Function(store: store, type: FunctionType(parameters: [], results: [])) { _, _ in
+                _ = try box.instance?.exports[function: "growit"]?()
+                return []
+            }
+        )
+        let instance = try module.instantiate(store: store, imports: imports)
+        box.instance = instance
+        let start = try #require(instance.exports[function: "start"])
+        #expect(try start() == [.i32(0x5A5A_5A5A)])
+    }
+
     func expectTrap(_ wat: String, assertTrap: (Trap) throws -> Void) throws {
         let module = try parseWasm(
             bytes: wat2wasm(wat, options: EncodeOptions(nameSection: true))
