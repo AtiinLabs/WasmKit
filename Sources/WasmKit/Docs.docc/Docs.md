@@ -97,8 +97,8 @@ See [examples](https://github.com/swiftwasm/WasmKit/tree/main/Examples) for exec
 
 ### Binary Parser
 
-- ``parseWasm(bytes:features:)``
-- ``parseWasm(filePath:features:)``
+- ``parseWasm(bytes:features:limits:)``
+- ``parseWasm(filePath:features:limits:)``
 
 ### Other WebAssembly Entities
 
