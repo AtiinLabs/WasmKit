@@ -29,11 +29,11 @@ public struct Parser<Stream: ByteStream> {
         return stream.currentIndex
     }
 
-    public init(stream: Stream, features: WasmFeatureSet = .default) {
+    public init(stream: Stream, features: WasmFeatureSet = .default, limits: ParsingLimits = .default) {
         self.stream = stream
         self.features = features
         self.nextParseTarget = .header
-        self.limits = .default
+        self.limits = limits
     }
 
     @usableFromInline
@@ -49,8 +49,9 @@ extension Parser where Stream == StaticByteStream {
     /// - Parameters:
     ///   - bytes: The bytes of the WebAssembly binary file to parse
     ///   - features: Enabled WebAssembly features for parsing
-    public init(bytes: [UInt8], features: WasmFeatureSet = .default) {
-        self.init(stream: StaticByteStream(bytes: bytes), features: features)
+    ///   - limits: Limits applied while parsing
+    public init(bytes: [UInt8], features: WasmFeatureSet = .default, limits: ParsingLimits = .default) {
+        self.init(stream: StaticByteStream(bytes: bytes), features: features, limits: limits)
     }
 }
 
@@ -61,8 +62,9 @@ extension Parser where Stream == FileHandleStream {
     /// - Parameters:
     ///   - fileHandle: The file handle to the WebAssembly binary file to parse
     ///   - features: Enabled WebAssembly features for parsing
-    public init(fileHandle: FileDescriptor, features: WasmFeatureSet = .default) throws {
-        self.init(stream: try FileHandleStream(fileHandle: fileHandle), features: features)
+    ///   - limits: Limits applied while parsing
+    public init(fileHandle: FileDescriptor, features: WasmFeatureSet = .default, limits: ParsingLimits = .default) throws {
+        self.init(stream: try FileHandleStream(fileHandle: fileHandle), features: features, limits: limits)
     }
 
     /// Initialize a new parser with the given file path
@@ -70,7 +72,8 @@ extension Parser where Stream == FileHandleStream {
     /// - Parameters:
     ///   - filePath: The file path to the WebAssembly binary file to parse
     ///   - features: Enabled WebAssembly features for parsing
-    public init(filePath: FilePath, features: WasmFeatureSet = .default) throws {
+    ///   - limits: Limits applied while parsing
+    public init(filePath: FilePath, features: WasmFeatureSet = .default, limits: ParsingLimits = .default) throws {
         #if os(Windows)
             // TODO: Upstream `O_BINARY` to `SystemPackage
             let accessMode = FileDescriptor.AccessMode(
@@ -80,7 +83,7 @@ extension Parser where Stream == FileHandleStream {
             let accessMode: FileDescriptor.AccessMode = .readOnly
         #endif
         let fileHandle = try FileDescriptor.open(filePath, accessMode)
-        self.init(stream: try FileHandleStream(fileHandle: fileHandle), features: features)
+        self.init(stream: try FileHandleStream(fileHandle: fileHandle), features: features, limits: limits)
     }
 }
 
@@ -268,6 +271,11 @@ extension WasmParserError.Message {
     @usableFromInline
     static func tooManyLocals(_ count: UInt64, limit: UInt64) -> Self {
         Self("Too many locals: \(count) vs \(limit)")
+    }
+
+    @usableFromInline
+    static func tooManyTotalLocals(_ count: UInt64, limit: UInt64) -> Self {
+        Self("Too many locals in module: \(count) vs \(limit)")
     }
 
     @usableFromInline static func expectedRefType(actual: ValueType) -> Self {
@@ -1016,21 +1024,42 @@ extension Parser {
     /// <https://webassembly.github.io/spec/core/binary/modules.html#code-section>
     @inlinable
     func parseCodeSection() throws -> [Code] {
+        // Sum of locals declared by the function bodies parsed so far. Invariant: never exceeds
+        // `limits.maxTotalLocals`.
+        var totalLocals: UInt64 = 0
         return try parseVector {
             let size = try parseUnsigned() as UInt32
             let bodyStart = stream.currentIndex
-            let localTypes = try parseVector { () -> (n: UInt32, type: ValueType) in
+            // Local declarations are validated one group at a time and expanded only after the
+            // running counts have been checked, so a function never allocates past the limits.
+            var functionLocals: UInt64 = 0
+            var locals: [ValueType] = []
+            let groupCount: UInt32 = try parseUnsigned()
+            for _ in 0..<groupCount {
                 let n: UInt32 = try parseUnsigned()
-                let t = try parseValueType()
-                return (n, t)
-            }
-            let totalLocals = localTypes.reduce(UInt64(0)) { $0 + UInt64($1.n) }
-            guard totalLocals < limits.maxFunctionLocals else {
-                throw makeError(.tooManyLocals(totalLocals, limit: limits.maxFunctionLocals))
-            }
+                let type = try parseValueType()
 
-            let locals = localTypes.flatMap { (n: UInt32, type: ValueType) in
-                return Array(repeating: type, count: Int(n))
+                let newFunctionLocals = functionLocals.addingReportingOverflow(UInt64(n))
+                guard !newFunctionLocals.overflow, newFunctionLocals.partialValue <= limits.maxFunctionLocals else {
+                    throw makeError(
+                        .tooManyLocals(
+                            newFunctionLocals.overflow ? .max : newFunctionLocals.partialValue,
+                            limit: limits.maxFunctionLocals
+                        )
+                    )
+                }
+                let newTotalLocals = totalLocals.addingReportingOverflow(UInt64(n))
+                guard !newTotalLocals.overflow, newTotalLocals.partialValue <= limits.maxTotalLocals else {
+                    throw makeError(
+                        .tooManyTotalLocals(
+                            newTotalLocals.overflow ? .max : newTotalLocals.partialValue,
+                            limit: limits.maxTotalLocals
+                        )
+                    )
+                }
+                functionLocals = newFunctionLocals.partialValue
+                totalLocals = newTotalLocals.partialValue
+                locals.append(contentsOf: repeatElement(type, count: Int(n)))
             }
             let expressionStart = stream.currentIndex
             let expressionBytes = try stream.consume(
@@ -1195,52 +1224,47 @@ extension Parser {
             let sectionStart = stream.currentIndex
 
             let payload: ParsingPayload
-            let order: OrderTracking.Order?
             switch sectionID {
             case 0:
-                order = nil
                 payload = .customSection(try parseCustomSection(size: sectionSize))
             case 1:
-                order = .type
+                try orderTracking.track(order: .type, parser: self)
                 payload = .typeSection(try parseTypeSection())
             case 2:
-                order = ._import
+                try orderTracking.track(order: ._import, parser: self)
                 payload = .importSection(try parseImportSection())
             case 3:
-                order = .function
+                try orderTracking.track(order: .function, parser: self)
                 payload = .functionSection(try parseFunctionSection())
             case 4:
-                order = .table
+                try orderTracking.track(order: .table, parser: self)
                 payload = .tableSection(try parseTableSection())
             case 5:
-                order = .memory
+                try orderTracking.track(order: .memory, parser: self)
                 payload = .memorySection(try parseMemorySection())
             case 6:
-                order = .global
+                try orderTracking.track(order: .global, parser: self)
                 payload = .globalSection(try parseGlobalSection())
             case 7:
-                order = .export
+                try orderTracking.track(order: .export, parser: self)
                 payload = .exportSection(try parseExportSection())
             case 8:
-                order = .start
+                try orderTracking.track(order: .start, parser: self)
                 payload = .startSection(try parseStartSection())
             case 9:
-                order = .element
+                try orderTracking.track(order: .element, parser: self)
                 payload = .elementSection(try parseElementSection())
             case 10:
-                order = .code
+                try orderTracking.track(order: .code, parser: self)
                 payload = .codeSection(try parseCodeSection())
             case 11:
-                order = .data
+                try orderTracking.track(order: .data, parser: self)
                 payload = .dataSection(try parseDataSection())
             case 12:
-                order = .dataCount
+                try orderTracking.track(order: .dataCount, parser: self)
                 payload = .dataCount(try parseDataCountSection())
             default:
                 throw makeError(.malformedSectionID(sectionID))
-            }
-            if let order = order {
-                try orderTracking.track(order: order, parser: self)
             }
             let expectedSectionEnd = sectionStart + Int(sectionSize)
             guard expectedSectionEnd == stream.currentIndex else {

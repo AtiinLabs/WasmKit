@@ -43,7 +43,7 @@ struct ModuleImports {
 }
 
 /// A unit of stateless WebAssembly code, which is a direct representation of a module file. You can get one
-/// by calling either ``parseWasm(bytes:features:)`` or ``parseWasm(filePath:features:)``.
+/// by calling either ``parseWasm(bytes:features:limits:)`` or ``parseWasm(filePath:features:limits:)``.
 /// > Note:
 /// <https://webassembly.github.io/spec/core/syntax/modules.html#modules>
 public struct Module {

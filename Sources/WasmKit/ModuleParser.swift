@@ -7,7 +7,7 @@ import WasmParser
 
 /// Parse a given file as a WebAssembly binary format file
 /// > Note: <https://webassembly.github.io/spec/core/binary/index.html>
-public func parseWasm(filePath: FilePath, features: WasmFeatureSet = .default) throws -> Module {
+public func parseWasm(filePath: FilePath, features: WasmFeatureSet = .default, limits: ParsingLimits = .default) throws -> Module {
     #if os(Windows)
         // TODO: Upstream `O_BINARY` to `SystemPackage
         let accessMode = FileDescriptor.AccessMode(
@@ -19,21 +19,23 @@ public func parseWasm(filePath: FilePath, features: WasmFeatureSet = .default) t
     let fileHandle = try FileDescriptor.open(filePath, accessMode)
     defer { try? fileHandle.close() }
     let stream = try FileHandleStream(fileHandle: fileHandle)
-    let module = try parseModule(stream: stream, features: features)
+    let module = try parseModule(stream: stream, features: features, limits: limits)
     return module
 }
 
 /// Parse a given byte array as a WebAssembly binary format file
 /// > Note: <https://webassembly.github.io/spec/core/binary/index.html>
-public func parseWasm(bytes: [UInt8], features: WasmFeatureSet = .default) throws -> Module {
+public func parseWasm(bytes: [UInt8], features: WasmFeatureSet = .default, limits: ParsingLimits = .default) throws -> Module {
     let stream = StaticByteStream(bytes: bytes)
-    let module = try parseModule(stream: stream, features: features)
+    let module = try parseModule(stream: stream, features: features, limits: limits)
     return module
 }
 
 /// > Note:
 /// <https://webassembly.github.io/spec/core/binary/modules.html#binary-module>
-func parseModule<Stream: ByteStream>(stream: Stream, features: WasmFeatureSet = .default) throws -> Module {
+func parseModule<Stream: ByteStream>(
+    stream: Stream, features: WasmFeatureSet = .default, limits: ParsingLimits = .default
+) throws -> Module {
     var types: [FunctionType] = []
     var typeIndices: [TypeIndex] = []
     var codes: [Code] = []
@@ -49,7 +51,7 @@ func parseModule<Stream: ByteStream>(stream: Stream, features: WasmFeatureSet = 
     var dataCount: UInt32?
 
     var parser = WasmParser.Parser<Stream>(
-        stream: stream, features: features
+        stream: stream, features: features, limits: limits
     )
 
     while let payload = try parser.parseNext() {
